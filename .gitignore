@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.ipynb_checkpoints/
+BOLD_queries.ipynb
+*.egg-info/
+build/
+dist/
+Icon*
+bold_raw_*.xml

@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bold-barcode-checking"
+version = "0.1.0"
+description = "Command-line workflow for COI extraction and BOLD BIN lookup from GCA accessions."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "biopython>=1.84",
+  "pandas>=2.0",
+  "requests>=2.31",
+]
+
+[project.scripts]
+bold-coi = "bold_coi_pipeline:main"
+
+[tool.setuptools]
+py-modules = ["bold_coi_pipeline"]
