@@ -81,4 +81,5 @@ If you use this workflow in a methods note, report, or manuscript, cite the unde
 
 - NCBI and BOLD services can change response formats or rate limits over time.
 - The workflow queries public BOLD data only.
+- BOLD relies on correct species identification of comparator records, so this workflow is a useful check rather than a definitive identification.
 - BIN metrics are a best-effort scrape from the public BOLD cluster page and may be absent for some hits.
