@@ -7,7 +7,6 @@ This repository packages a command-line workflow for:
 3. querying BOLD for public barcode matches and BIN assignments
 4. retrieving BIN-level distance and nearest-neighbour metadata when available
 
-The project is CLI-first, so a notebook is not required.
 
 ## Requirements
 
