@@ -6,6 +6,7 @@ querying BOLD for BIN assignments.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -29,8 +30,14 @@ NCBI_DATASETS_URL = (
 )
 NCBI_ORGANELLE_DOWNLOAD = "https://api.ncbi.nlm.nih.gov/datasets/v2/organelle/download"
 BOLD_IDS_ENDPOINT = "http://v4.boldsystems.org/index.php/Ids_xml"
+BOLD_V5_SUBMISSION_ENDPOINT = "https://id.boldsystems.org/submission"
+BOLD_V5_STATUS_ENDPOINT = "https://id.boldsystems.org/submission/status/{sub_id}"
+BOLD_V5_RESULTS_ENDPOINT = "https://id.boldsystems.org/submission/results/{sub_id}"
 PORTAL_QUERY_ENDPOINT = "https://portal.boldsystems.org/api/query"
 PORTAL_DOCS_ENDPOINT = "https://portal.boldsystems.org/api/documents/{query_id}"
+LCO1490 = "GGTCAACAAATCATAAAGATATTGG"
+HCO2198 = "TAAACTTCAGGGTGACCAAAAAATCA"
+PRIMER_MAX_MISMATCHES = 4
 
 _ENTREZ_READY = False
 
@@ -75,6 +82,39 @@ def _infer_species_from_description(description: str) -> Optional[str]:
         # Basic sanity: capitalize genus, lower species
         return candidate.strip()
     return None
+
+
+def _normalise_name(name: Optional[str]) -> Optional[str]:
+    if not name:
+        return None
+    return re.sub(r"\s+", " ", name).strip().lower()
+
+
+def _hamming_distance(left: str, right: str) -> int:
+    return sum(a != b for a, b in zip(left, right))
+
+
+def _find_approximate_primer(
+    sequence: str,
+    primer: str,
+    *,
+    max_mismatches: int = PRIMER_MAX_MISMATCHES,
+) -> Optional[Dict[str, object]]:
+    best: Optional[Dict[str, object]] = None
+    primer_length = len(primer)
+    for start in range(0, len(sequence) - primer_length + 1):
+        candidate = sequence[start : start + primer_length]
+        mismatches = _hamming_distance(candidate, primer)
+        if mismatches > max_mismatches:
+            continue
+        if best is None or mismatches < int(best["mismatches"]):
+            best = {
+                "start": start,
+                "end": start + primer_length,
+                "mismatches": mismatches,
+                "sequence": candidate,
+            }
+    return best
 
 
 @dataclass
@@ -184,8 +224,51 @@ def fetch_mitochondrial_sequence(accession: str) -> Optional[SeqRecord]:
     return None
 
 
+def locate_coi_region_by_primers(sequence: str, seq_id: str) -> Optional[Dict[str, object]]:
+    """Locate the standard COI barcode region using approximate LCO/HCO primer matches."""
+    clean_seq = sequence.upper().replace(" ", "").replace("\n", "")
+    hco_reverse_complement = str(Seq(HCO2198).reverse_complement())
+
+    for strand, oriented_sequence in (
+        ("+", clean_seq),
+        ("-", str(Seq(clean_seq).reverse_complement())),
+    ):
+        forward = _find_approximate_primer(oriented_sequence, LCO1490)
+        reverse = _find_approximate_primer(oriented_sequence, hco_reverse_complement)
+        if not forward or not reverse:
+            continue
+        if int(forward["start"]) >= int(reverse["end"]):
+            continue
+
+        subseq = oriented_sequence[int(forward["start"]) : int(reverse["end"])]
+        if not 500 <= len(subseq) <= 850:
+            continue
+
+        if strand == "+":
+            start = int(forward["start"])
+            end = int(reverse["end"])
+        else:
+            start = len(clean_seq) - int(reverse["end"])
+            end = len(clean_seq) - int(forward["start"])
+
+        return {
+            "sequence": subseq,
+            "start": start,
+            "end": end,
+            "strand": strand,
+            "identity": 1.0,
+            "match_title": f"{seq_id} COI barcode region located by LCO1490/HCO2198 primer matches",
+        }
+
+    return None
+
+
 def blast_for_coi_region(sequence: str, seq_id: str) -> Optional[Dict[str, object]]:
     """Identify COI by blasting the mitogenome (blastx vs nr)."""
+    primer_hit = locate_coi_region_by_primers(sequence, seq_id)
+    if primer_hit:
+        return primer_hit
+
     _ensure_entrez()
     blast_handle = NCBIWWW.qblast(
         program="blastx",
@@ -244,11 +327,101 @@ def blast_for_coi_region(sequence: str, seq_id: str) -> Optional[Dict[str, objec
     }
 
 
+def query_bold_v5_for_coi(sequence: str) -> Dict[str, Optional[str]]:
+    """Submit the COI region to the current BOLD v5 Identification Engine."""
+    fasta = f">query\n{sequence}\n"
+    params = {
+        "db": "public.tax-derep",
+        "mi": "0.94",
+        "mo": "100",
+        "maxh": "25",
+        "order": "3",
+    }
+    session = requests.Session()
+    session.get("https://id.boldsystems.org/", timeout=BOLD_TIMEOUT)
+    submit_resp = session.post(
+        BOLD_V5_SUBMISSION_ENDPOINT,
+        params=params,
+        files={"fasta_file": ("submitted.fas", fasta, "text/plain")},
+        timeout=BOLD_TIMEOUT,
+    )
+    submit_resp.raise_for_status()
+    sub_id = submit_resp.json().get("sub_id")
+    if not sub_id:
+        raise RuntimeError("BOLD v5 submission did not return a submission id.")
+
+    deadline = time.time() + max(BOLD_TIMEOUT, 180)
+    while True:
+        status_resp = session.get(
+            BOLD_V5_STATUS_ENDPOINT.format(sub_id=sub_id),
+            timeout=BOLD_TIMEOUT,
+        )
+        status_resp.raise_for_status()
+        status = status_resp.json().get("status")
+        if status == "complete":
+            break
+        if time.time() > deadline:
+            raise TimeoutError(f"BOLD v5 submission did not complete: {sub_id}")
+        time.sleep(5)
+
+    results_resp = session.get(
+        BOLD_V5_RESULTS_ENDPOINT.format(sub_id=sub_id),
+        timeout=BOLD_TIMEOUT,
+    )
+    results_resp.raise_for_status()
+    text = results_resp.text
+
+    matches: List[Dict[str, Optional[str]]] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        result = json.loads(line)
+        for result_id, hit in (result.get("results") or {}).items():
+            fields = result_id.split("|")
+            process_id = fields[0] if len(fields) > 0 else None
+            bin_uri = fields[2] if len(fields) > 2 and fields[2] else None
+            taxonomy = hit.get("taxonomy") or {}
+            species = taxonomy.get("species") or None
+            genus = taxonomy.get("genus") or None
+            match_name = species or genus
+            pdist = hit.get("pdist")
+            similarity = None
+            if pdist is not None:
+                similarity = max(0.0, 100.0 - float(pdist))
+            elif hit.get("pident") is not None:
+                similarity = float(hit["pident"])
+
+            matches.append(
+                {
+                    "process_id": process_id,
+                    "bin": bin_uri,
+                    "similarity": similarity,
+                    "match_name": match_name,
+                }
+            )
+
+    top = next((match for match in matches if match.get("match_name")), matches[0] if matches else {})
+    return {
+        "status": "success",
+        "bin_number": top.get("bin"),
+        "top_match": top.get("match_name"),
+        "similarity": top.get("similarity"),
+        "process_id": top.get("process_id"),
+        "matches": matches,
+        "raw_response": text,
+    }
+
+
 def query_bold_for_coi(sequence: str) -> Dict[str, Optional[str]]:
     """Submit the COI region to the BOLD identification API."""
     clean_seq = sequence.upper().replace(" ", "").replace("\n", "")
     if len(clean_seq) < 400:
         raise ValueError("COI sequence is unexpectedly short; refusing to query BOLD.")
+
+    try:
+        return query_bold_v5_for_coi(clean_seq)
+    except Exception:
+        pass
 
     resp = requests.get(
         BOLD_IDS_ENDPOINT,
@@ -434,7 +607,8 @@ def lookup_bin_from_processid(process_id: str) -> Optional[str]:
 
 
 def _select_match_and_self_flag(
-    matches: List[Dict[str, Optional[str]]]
+    matches: List[Dict[str, Optional[str]]],
+    expected_species: Optional[str] = None,
 ) -> Dict[str, object]:
     """
     Choose which BOLD match to report and whether the top hit looks like a self-hit.
@@ -446,10 +620,24 @@ def _select_match_and_self_flag(
     if not matches:
         return {"chosen": {}, "self_hit": False, "skipped": None}
 
-    top = matches[0]
+    expected = _normalise_name(expected_species)
+    species_matches = [match for match in matches if match.get("match_name")]
+    if expected:
+        expected_matches = [
+            match
+            for match in species_matches
+            if _normalise_name(str(match.get("match_name") or "")) == expected
+        ]
+        if expected_matches:
+            chosen = max(expected_matches, key=lambda match: match.get("similarity") or 0.0)
+            return {"chosen": chosen, "self_hit": False, "skipped": None}
+
+    top = species_matches[0] if species_matches else matches[0]
     top_sim = top.get("similarity") or 0.0
     if top_sim >= 99.5 and len(matches) > 1:
-        return {"chosen": matches[1], "self_hit": True, "skipped": top}
+        alternatives = [match for match in species_matches if match is not top]
+        chosen = alternatives[0] if alternatives else matches[1]
+        return {"chosen": chosen, "self_hit": True, "skipped": top}
 
     return {"chosen": top, "self_hit": False, "skipped": None}
 
@@ -489,7 +677,7 @@ def process_gca_accession(gca_accession: str) -> WorkflowResult:
         bold_result = query_bold_for_coi(result.coi_sequence)
         matches = bold_result.get("matches") or []
         # Decide which match to report (skip likely self-hit if present)
-        selection = _select_match_and_self_flag(matches)
+        selection = _select_match_and_self_flag(matches, result.mt_species)
         chosen = selection.get("chosen") or {}
 
         result.bin_number = chosen.get("bin") or bold_result.get("bin_number")
